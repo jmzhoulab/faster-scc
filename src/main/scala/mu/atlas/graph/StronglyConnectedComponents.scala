@@ -17,6 +17,7 @@
 
 package mu.atlas.graph
 
+import org.apache.log4j.{LogManager, Logger}
 import org.apache.spark.graphx.PartitionStrategy.RandomVertexCut
 import org.apache.spark.graphx._
 
@@ -24,6 +25,8 @@ import scala.reflect.ClassTag
 
 /** Strongly connected components algorithm implementation. */
 object StronglyConnectedComponents {
+
+  private val log: Logger = LogManager.getLogger(getClass)
 
   /**
     * Compute the strongly connected component (SCC) of each vertex and return a graph with the
@@ -48,29 +51,32 @@ object StronglyConnectedComponents {
 
     var numVertices = sccWorkGraph.numVertices
 
-    println("****** Total vertices in graph: " + numVertices)
+    log.info("Total vertices in graph: " + numVertices)
 
     var iter = 0
     while (sccWorkGraph.numVertices > 0 && iter < numIter) {
       iter += 1
       numVertices = sccWorkGraph.numVertices
-      println(s"****** Start iter $iter, remain not color vertices $numVertices")
+
+      log.info(s"Start iter $iter, remain not color vertices $numVertices")
+
       val outDegreeSccWorkGraph = sccWorkGraph.outerJoinVertices(sccWorkGraph.outDegrees) {
         (vid, data, degreeOpt) => (0, degreeOpt.getOrElse(0), false)
-      }
+      }.cache()
+
+      outDegreeSccWorkGraph.numVertices
+      outDegreeSccWorkGraph.numEdges
 
       // currency vertex inDegrees, outDegrees, and isRemove
       val degreeSccWorkGraph =  outDegreeSccWorkGraph.outerJoinVertices(sccWorkGraph.inDegrees) {
         (vid, data, degreeOpt) => (degreeOpt.getOrElse(0), data._2, data._3)
-      }
+      }.cache()
 
-      println("****** Color vertices recursively according to degrees")
+      degreeSccWorkGraph.numVertices
+      degreeSccWorkGraph.numEdges
 
-      // start at vertices with zero inDegrees or zero outDegrees.
-      // if src vertex's inDegrees is zero and src vertex is not remote,
-      // then send message '(1, 0, false)' to dst vertex which reduce the inDegrees according this message
-      // and send message '(0, 0, true)' to src vertex which tag src vertex has been removed.
-      // Similarly, if dst vertex's outDegrees is zero and dst vertex is not remote, send message at the same.
+      log.info("Color vertices recursively according to degrees")
+
       val prevSccWorkGraph = degreeSccWorkGraph.pregel((0, 0, false))(
         (vid, myDegree, msgDegree) => {
           if (myDegree._3)
@@ -101,7 +107,9 @@ object StronglyConnectedComponents {
       val prevSccGraph = sccGraph
 
       // write values to sccGraph
-      sccGraph = sccGraph.outerJoinVertices(finalVertices){(vid, scc, opt) => opt.getOrElse(scc)}.cache()
+      sccGraph = sccGraph.outerJoinVertices(finalVertices) {
+        (vid, scc, opt) => opt.getOrElse(scc)
+      }.cache()
 
       sccGraph.numVertices
       sccGraph.numEdges
@@ -109,9 +117,11 @@ object StronglyConnectedComponents {
 
       // only keep vertices that are not final
       val prevResult = sccWorkGraph
-      sccWorkGraph = prevSccWorkGraph.subgraph(vpred = (vid, data) => !data._3).partitionBy(RandomVertexCut).cache()
+      sccWorkGraph = prevSccWorkGraph.subgraph(vpred = (vid, data) => !data._3)
+        .partitionBy(RandomVertexCut)
+        .cache()
 
-      println("****** After color by degree, remain not color vertices " + sccWorkGraph.numVertices)
+      log.info("After color by degree, remain not color vertices " + sccWorkGraph.numVertices)
       sccWorkGraph.numEdges
       prevResult.unpersist(blocking = false)
       prevSccWorkGraph.unpersist(blocking = false)
@@ -120,7 +130,7 @@ object StronglyConnectedComponents {
 
       // collect min of all my neighbor's scc values, update if it's smaller than mine
       // then notify any neighbors with scc values larger than mine
-      val notifySccWorkGraph = Pregel[(VertexId, Boolean), ED, VertexId](
+      val pregelSccWorkGraph = Pregel[(VertexId, Boolean), ED, VertexId](
         resetSccWorkGraph, Long.MaxValue, activeDirection = EdgeDirection.Out)(
         (vid, myScc, neighborScc) => (math.min(myScc._1, neighborScc), myScc._2),
         e => {
@@ -132,6 +142,8 @@ object StronglyConnectedComponents {
         },
         (vid1, vid2) => math.min(vid1, vid2))
 
+      pregelSccWorkGraph.edges.count()
+      pregelSccWorkGraph.vertices.count()
       resetSccWorkGraph.unpersist(false)
       sccWorkGraph.unpersist(false)
 
@@ -139,7 +151,7 @@ object StronglyConnectedComponents {
       // do not propagate if colors do not match!
 
       val colorSccWorkGraph = Pregel[(VertexId, Boolean), ED, Boolean](
-        notifySccWorkGraph, false, activeDirection = EdgeDirection.In)(
+        pregelSccWorkGraph, false, activeDirection = EdgeDirection.In)(
         // vertex is final if it is the root of a color
         // or it has the same color as a neighbor that is final
         (vid, myScc, existsSameColorFinalNeighbor) => {
@@ -158,8 +170,7 @@ object StronglyConnectedComponents {
         },
         (final1, final2) => final1 || final2)
 
-      val colorVertices = colorSccWorkGraph.vertices.filter{case(vid, (scc, isFinal)) => isFinal}
-        .mapValues{(vid, data) => data._1}
+      val colorVertices = colorSccWorkGraph.vertices.filter{case(vid, (scc, isFinal)) => isFinal}.mapValues{(vid, data) => data._1}
 
       val prev1SccGraph = sccGraph
 
@@ -181,14 +192,15 @@ object StronglyConnectedComponents {
       sccWorkGraph.numEdges
       prev1Result.unpersist(blocking = false)
 
-      println(s"****** Finished iter $iter, remain not color vertices " + sccWorkGraph.numVertices)
+      log.info(s"Finished iter $iter, remain not color vertices " + sccWorkGraph.numVertices)
 
-      notifySccWorkGraph.unpersist(blocking = false)
+      pregelSccWorkGraph.unpersist(blocking = false)
       colorSccWorkGraph.unpersist(blocking = false)
 
     }
-    println("****** Finished scc")
+    log.info("Finished scc")
     sccGraph
   }
 
 }
+
